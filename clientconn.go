@@ -146,8 +146,18 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 	cc.safeConfigSelector.UpdateConfigSelector(&defaultConfigSelector{nil})
 	cc.ctx, cc.cancel = context.WithCancel(context.Background())
 
-	for _, opt := range extraDialOptions {
-		opt.apply(&cc.dopts)
+	disableGlobalOpts := false
+	for _, opt := range opts {
+		if _, ok := opt.(*disableGlobalDialOptions); ok {
+			disableGlobalOpts = true
+			break
+		}
+	}
+
+	if !disableGlobalOpts {
+		for _, opt := range globalDialOptions {
+			opt.apply(&cc.dopts)
+		}
 	}
 
 	for _, opt := range opts {
@@ -163,40 +173,11 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 		}
 	}()
 
-	pid := cc.dopts.channelzParentID
-	cc.channelzID = channelz.RegisterChannel(&channelzChannel{cc}, pid, target)
-	ted := &channelz.TraceEventDesc{
-		Desc:     "Channel created",
-		Severity: channelz.CtInfo,
-	}
-	if cc.dopts.channelzParentID != nil {
-		ted.Parent = &channelz.TraceEventDesc{
-			Desc:     fmt.Sprintf("Nested Channel(id:%d) created", cc.channelzID.Int()),
-			Severity: channelz.CtInfo,
-		}
-	}
-	channelz.AddTraceEvent(logger, cc.channelzID, 1, ted)
-	cc.csMgr.channelzID = cc.channelzID
+	// Register ClientConn with channelz.
+	cc.channelzRegistration(target)
 
-	if cc.dopts.copts.TransportCredentials == nil && cc.dopts.copts.CredsBundle == nil {
-		return nil, errNoTransportSecurity
-	}
-	if cc.dopts.copts.TransportCredentials != nil && cc.dopts.copts.CredsBundle != nil {
-		return nil, errTransportCredsAndBundle
-	}
-	if cc.dopts.copts.CredsBundle != nil && cc.dopts.copts.CredsBundle.TransportCredentials() == nil {
-		return nil, errNoTransportCredsInBundle
-	}
-	transportCreds := cc.dopts.copts.TransportCredentials
-	if transportCreds == nil {
-		transportCreds = cc.dopts.copts.CredsBundle.TransportCredentials()
-	}
-	if transportCreds.Info().SecurityProtocol == "insecure" {
-		for _, cd := range cc.dopts.copts.PerRPCCredentials {
-			if cd.RequireTransportSecurity() {
-				return nil, errTransportCredentialsMissing
-			}
-		}
+	if err := cc.validateTransportCredentials(); err != nil {
+		return nil, err
 	}
 
 	if cc.dopts.defaultServiceConfigRawJSON != nil {
@@ -234,35 +215,19 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 		}
 	}()
 
-	scSet := false
-	if cc.dopts.scChan != nil {
-		// Try to get an initial service config.
-		select {
-		case sc, ok := <-cc.dopts.scChan:
-			if ok {
-				cc.sc = &sc
-				cc.safeConfigSelector.UpdateConfigSelector(&defaultConfigSelector{&sc})
-				scSet = true
-			}
-		default:
-		}
-	}
 	if cc.dopts.bs == nil {
 		cc.dopts.bs = backoff.DefaultExponential
 	}
 
 	// Determine the resolver to use.
-	resolverBuilder, err := cc.parseTargetAndFindResolver()
-	if err != nil {
+	if err := cc.parseTargetAndFindResolver(); err != nil {
 		return nil, err
 	}
-	cc.authority, err = determineAuthority(cc.parsedTarget.Endpoint, cc.target, cc.dopts)
-	if err != nil {
+	if err = cc.determineAuthority(); err != nil {
 		return nil, err
 	}
-	channelz.Infof(logger, cc.channelzID, "Channel authority set to %q", cc.authority)
 
-	if cc.dopts.scChan != nil && !scSet {
+	if cc.dopts.scChan != nil {
 		// Blocking wait for the initial service config.
 		select {
 		case sc, ok := <-cc.dopts.scChan:
@@ -293,7 +258,17 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 	})
 
 	// Build the resolver.
-	rWrapper, err := newCCResolverWrapper(cc, resolverBuilder)
+	rWrapper, err := newCCResolverWrapper(cc, ccResolverWrapperOpts{
+		target:  cc.parsedTarget,
+		builder: cc.resolverBuilder,
+		bOpts: resolver.BuildOptions{
+			DisableServiceConfig: cc.dopts.disableServiceConfig,
+			DialCreds:            credsClone,
+			CredsBundle:          cc.dopts.copts.CredsBundle,
+			Dialer:               cc.dopts.copts.Dialer,
+		},
+		channelzID: cc.channelzID,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to build resolver: %v", err)
 	}
@@ -329,6 +304,64 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 	}
 
 	return cc, nil
+}
+
+// validateTransportCredentials performs a series of checks on the configured
+// transport credentials. It returns a non-nil error if any of these conditions
+// are met:
+//   - no transport creds and no creds bundle is configured
+//   - both transport creds and creds bundle are configured
+//   - creds bundle is configured, but it lacks a transport credentials
+//   - insecure transport creds configured alongside call creds that require
+//     transport level security
+//
+// If none of the above conditions are met, the configured credentials are
+// deemed valid and a nil error is returned.
+func (cc *ClientConn) validateTransportCredentials() error {
+	if cc.dopts.copts.TransportCredentials == nil && cc.dopts.copts.CredsBundle == nil {
+		return errNoTransportSecurity
+	}
+	if cc.dopts.copts.TransportCredentials != nil && cc.dopts.copts.CredsBundle != nil {
+		return errTransportCredsAndBundle
+	}
+	if cc.dopts.copts.CredsBundle != nil && cc.dopts.copts.CredsBundle.TransportCredentials() == nil {
+		return errNoTransportCredsInBundle
+	}
+	transportCreds := cc.dopts.copts.TransportCredentials
+	if transportCreds == nil {
+		transportCreds = cc.dopts.copts.CredsBundle.TransportCredentials()
+	}
+	if transportCreds.Info().SecurityProtocol == "insecure" {
+		for _, cd := range cc.dopts.copts.PerRPCCredentials {
+			if cd.RequireTransportSecurity() {
+				return errTransportCredentialsMissing
+			}
+		}
+	}
+	return nil
+}
+
+// channelzRegistration registers the newly created ClientConn with channelz and
+// stores the returned identifier in `cc.channelzID` and `cc.csMgr.channelzID`.
+// A channelz trace event is emitted for ClientConn creation. If the newly
+// created ClientConn is a nested one, i.e a valid parent ClientConn ID is
+// specified via a dial option, the trace event is also added to the parent.
+//
+// Doesn't grab cc.mu as this method is expected to be called only at Dial time.
+func (cc *ClientConn) channelzRegistration(target string) {
+	cc.channelzID = channelz.RegisterChannel(&channelzChannel{cc}, cc.dopts.channelzParentID, target)
+	ted := &channelz.TraceEventDesc{
+		Desc:     "Channel created",
+		Severity: channelz.CtInfo,
+	}
+	if cc.dopts.channelzParentID != nil {
+		ted.Parent = &channelz.TraceEventDesc{
+			Desc:     fmt.Sprintf("Nested Channel(id:%d) created", cc.channelzID.Int()),
+			Severity: channelz.CtInfo,
+		}
+	}
+	channelz.AddTraceEvent(logger, cc.channelzID, 1, ted)
+	cc.csMgr.channelzID = cc.channelzID
 }
 
 // chainUnaryClientInterceptors chains all unary client interceptors into one.
@@ -474,6 +507,7 @@ type ClientConn struct {
 	authority       string               // See determineAuthority().
 	dopts           dialOptions          // Default and user specified dial options.
 	channelzID      *channelz.Identifier // Channelz identifier for the channel.
+	resolverBuilder resolver.Builder     // See parseTargetAndFindResolver().
 	balancerWrapper *ccBalancerWrapper   // Uses gracefulswitch.balancer underneath.
 
 	// The following provide their own synchronization, and therefore don't
@@ -934,7 +968,7 @@ func (cc *ClientConn) healthCheckConfig() *healthCheckConfig {
 	return cc.sc.healthCheckConfig
 }
 
-func (cc *ClientConn) getTransport(ctx context.Context, failfast bool, method string) (transport.ClientTransport, func(balancer.DoneInfo), error) {
+func (cc *ClientConn) getTransport(ctx context.Context, failfast bool, method string) (transport.ClientTransport, balancer.PickResult, error) {
 	return cc.blockingpicker.pick(ctx, failfast, balancer.PickInfo{
 		Ctx:            ctx,
 		FullMethodName: method,
@@ -1103,7 +1137,11 @@ func (ac *addrConn) updateConnectivityState(s connectivity.State, lastErr error)
 		return
 	}
 	ac.state = s
-	channelz.Infof(logger, ac.channelzID, "Subchannel Connectivity change to %v", s)
+	if lastErr == nil {
+		channelz.Infof(logger, ac.channelzID, "Subchannel Connectivity change to %v", s)
+	} else {
+		channelz.Infof(logger, ac.channelzID, "Subchannel Connectivity change to %v, last error: %s", s, lastErr)
+	}
 	ac.cc.handleSubConnStateChange(ac.acbw, s, lastErr)
 }
 
@@ -1237,9 +1275,11 @@ func (ac *addrConn) createTransport(addr resolver.Address, copts transport.Conne
 	addr.ServerName = ac.cc.getServerName(addr)
 	hctx, hcancel := context.WithCancel(ac.ctx)
 
-	onClose := grpcsync.OnceFunc(func() {
+	onClose := func(r transport.GoAwayReason) {
 		ac.mu.Lock()
 		defer ac.mu.Unlock()
+		// adjust params based on GoAwayReason
+		ac.adjustParams(r)
 		if ac.state == connectivity.Shutdown {
 			// Already shut down.  tearDown() already cleared the transport and
 			// canceled hctx via ac.ctx, and we expected this connection to be
@@ -1260,19 +1300,13 @@ func (ac *addrConn) createTransport(addr resolver.Address, copts transport.Conne
 		// Always go idle and wait for the LB policy to initiate a new
 		// connection attempt.
 		ac.updateConnectivityState(connectivity.Idle, nil)
-	})
-	onGoAway := func(r transport.GoAwayReason) {
-		ac.mu.Lock()
-		ac.adjustParams(r)
-		ac.mu.Unlock()
-		onClose()
 	}
 
 	connectCtx, cancel := context.WithDeadline(ac.ctx, connectDeadline)
 	defer cancel()
 	copts.ChannelzParentID = ac.channelzID
 
-	newTr, err := transport.NewClientTransport(connectCtx, ac.cc.ctx, addr, copts, onGoAway, onClose)
+	newTr, err := transport.NewClientTransport(connectCtx, ac.cc.ctx, addr, copts, onClose)
 	if err != nil {
 		if logger.V(2) {
 			logger.Infof("Creating new client transport to %q: %v", addr, err)
@@ -1380,7 +1414,7 @@ func (ac *addrConn) startHealthCheck(ctx context.Context) {
 			if status.Code(err) == codes.Unimplemented {
 				channelz.Error(logger, ac.channelzID, "Subchannel health check is unimplemented at server side, thus health check is disabled")
 			} else {
-				channelz.Errorf(logger, ac.channelzID, "HealthCheckFunc exits with unexpected error %v", err)
+				channelz.Errorf(logger, ac.channelzID, "Health checking failed: %v", err)
 			}
 		}
 	}()
@@ -1531,6 +1565,9 @@ func (c *channelzChannel) ChannelzMetric() *channelz.ChannelInternalMetric {
 // referenced by users.
 var ErrClientConnTimeout = errors.New("grpc: timed out when dialing")
 
+// getResolver finds the scheme in the cc's resolvers or the global registry.
+// scheme should always be lowercase (typically by virtue of url.Parse()
+// performing proper RFC3986 behavior).
 func (cc *ClientConn) getResolver(scheme string) resolver.Builder {
 	for _, rb := range cc.dopts.resolvers {
 		if scheme == rb.Scheme() {
@@ -1552,7 +1589,14 @@ func (cc *ClientConn) connectionError() error {
 	return cc.lastConnectionError
 }
 
-func (cc *ClientConn) parseTargetAndFindResolver() (resolver.Builder, error) {
+// parseTargetAndFindResolver parses the user's dial target and stores the
+// parsed target in `cc.parsedTarget`.
+//
+// The resolver to use is determined based on the scheme in the parsed target
+// and the same is stored in `cc.resolverBuilder`.
+//
+// Doesn't grab cc.mu as this method is expected to be called only at Dial time.
+func (cc *ClientConn) parseTargetAndFindResolver() error {
 	channelz.Infof(logger, cc.channelzID, "original dial target is: %q", cc.target)
 
 	var rb resolver.Builder
@@ -1564,7 +1608,8 @@ func (cc *ClientConn) parseTargetAndFindResolver() (resolver.Builder, error) {
 		rb = cc.getResolver(parsedTarget.URL.Scheme)
 		if rb != nil {
 			cc.parsedTarget = parsedTarget
-			return rb, nil
+			cc.resolverBuilder = rb
+			return nil
 		}
 	}
 
@@ -1579,42 +1624,30 @@ func (cc *ClientConn) parseTargetAndFindResolver() (resolver.Builder, error) {
 	parsedTarget, err = parseTarget(canonicalTarget)
 	if err != nil {
 		channelz.Infof(logger, cc.channelzID, "dial target %q parse failed: %v", canonicalTarget, err)
-		return nil, err
+		return err
 	}
 	channelz.Infof(logger, cc.channelzID, "parsed dial target is: %+v", parsedTarget)
 	rb = cc.getResolver(parsedTarget.URL.Scheme)
 	if rb == nil {
-		return nil, fmt.Errorf("could not get resolver for default scheme: %q", parsedTarget.URL.Scheme)
+		return fmt.Errorf("could not get resolver for default scheme: %q", parsedTarget.URL.Scheme)
 	}
 	cc.parsedTarget = parsedTarget
-	return rb, nil
+	cc.resolverBuilder = rb
+	return nil
 }
 
 // parseTarget uses RFC 3986 semantics to parse the given target into a
-// resolver.Target struct containing scheme, authority and endpoint. Query
+// resolver.Target struct containing scheme, authority and url. Query
 // params are stripped from the endpoint.
 func parseTarget(target string) (resolver.Target, error) {
 	u, err := url.Parse(target)
 	if err != nil {
 		return resolver.Target{}, err
 	}
-	// For targets of the form "[scheme]://[authority]/endpoint, the endpoint
-	// value returned from url.Parse() contains a leading "/". Although this is
-	// in accordance with RFC 3986, we do not want to break existing resolver
-	// implementations which expect the endpoint without the leading "/". So, we
-	// end up stripping the leading "/" here. But this will result in an
-	// incorrect parsing for something like "unix:///path/to/socket". Since we
-	// own the "unix" resolver, we can workaround in the unix resolver by using
-	// the `URL` field instead of the `Endpoint` field.
-	endpoint := u.Path
-	if endpoint == "" {
-		endpoint = u.Opaque
-	}
-	endpoint = strings.TrimPrefix(endpoint, "/")
+
 	return resolver.Target{
 		Scheme:    u.Scheme,
 		Authority: u.Host,
-		Endpoint:  endpoint,
 		URL:       *u,
 	}, nil
 }
@@ -1623,7 +1656,15 @@ func parseTarget(target string) (resolver.Target, error) {
 // - user specified authority override using `WithAuthority` dial option
 // - creds' notion of server name for the authentication handshake
 // - endpoint from dial target of the form "scheme://[authority]/endpoint"
-func determineAuthority(endpoint, target string, dopts dialOptions) (string, error) {
+//
+// Stores the determined authority in `cc.authority`.
+//
+// Returns a non-nil error if the authority returned by the transport
+// credentials do not match the authority configured through the dial option.
+//
+// Doesn't grab cc.mu as this method is expected to be called only at Dial time.
+func (cc *ClientConn) determineAuthority() error {
+	dopts := cc.dopts
 	// Historically, we had two options for users to specify the serverName or
 	// authority for a channel. One was through the transport credentials
 	// (either in its constructor, or through the OverrideServerName() method).
@@ -1640,25 +1681,29 @@ func determineAuthority(endpoint, target string, dopts dialOptions) (string, err
 	}
 	authorityFromDialOption := dopts.authority
 	if (authorityFromCreds != "" && authorityFromDialOption != "") && authorityFromCreds != authorityFromDialOption {
-		return "", fmt.Errorf("ClientConn's authority from transport creds %q and dial option %q don't match", authorityFromCreds, authorityFromDialOption)
+		return fmt.Errorf("ClientConn's authority from transport creds %q and dial option %q don't match", authorityFromCreds, authorityFromDialOption)
 	}
 
+	endpoint := cc.parsedTarget.Endpoint()
+	target := cc.target
 	switch {
 	case authorityFromDialOption != "":
-		return authorityFromDialOption, nil
+		cc.authority = authorityFromDialOption
 	case authorityFromCreds != "":
-		return authorityFromCreds, nil
+		cc.authority = authorityFromCreds
 	case strings.HasPrefix(target, "unix:") || strings.HasPrefix(target, "unix-abstract:"):
 		// TODO: remove when the unix resolver implements optional interface to
 		// return channel authority.
-		return "localhost", nil
+		cc.authority = "localhost"
 	case strings.HasPrefix(endpoint, ":"):
-		return "localhost" + endpoint, nil
+		cc.authority = "localhost" + endpoint
 	default:
 		// TODO: Define an optional interface on the resolver builder to return
 		// the channel authority given the user's dial target. For resolvers
 		// which don't implement this interface, we will use the endpoint from
 		// "scheme://authority/endpoint" as the default authority.
-		return endpoint, nil
+		cc.authority = endpoint
 	}
+	channelz.Infof(logger, cc.channelzID, "Channel authority set to %q", cc.authority)
+	return nil
 }
